@@ -1,0 +1,884 @@
+// ShimanoSniffer.tc — Dual-channel Shimano UART sniffer for ESP32
+// Web UI with live log, optional decode + file logging.
+
+// NOTE: In sniffer mode both pins are high-impedance RX (TX=-1) to avoid
+// affecting the bus. In simulator mode GPIO18 is reconfigured as TX so we
+// can drive the battery's RX line as if we were the motor/charger.
+
+#define CH1_RX_PIN   19 // B-TX Pin (Battery TX — battery → charger/motor)
+#define CH2_RX_PIN   18 // B-RX Pin (Battery RX — charger/motor → battery; reused as TX in sim mode)
+#define BAUD         9600
+#define SERIAL_CFG   3
+#define BUF_SIZE     256
+#define GAP_MS       3
+#define MAX_MSG      128
+#define MAX_PAYLOAD  64
+#define LOG_FILE     "/shimano.log"
+#define LOG_MAX_SIZE 100000
+
+int h1 = -1;
+int h2 = -1;
+
+char msg1[MAX_MSG];
+int  msg1_len = 0;
+int  last1 = 0;
+
+char msg2[MAX_MSG];
+int  msg2_len = 0;
+int  last2 = 0;
+
+int seq = 0;
+int cnt1 = 0;
+int cnt2 = 0;
+int err1 = 0;
+int err2 = 0;
+
+int opt_decode = 0;
+int opt_flog = 0;
+int opt_running = 1;
+int opt_mode = 0;        // 0 = Sniffer, 1 = Sim-Motor, 2 = Sim-BMS
+int last_mode = -1;
+
+// BMS-Sim fake telemetry (used when responding to motor polls)
+int bms_state = 0;       // 0=Init, 1=Act, 2=Pre, 3=Chg
+int bms_vbat = 36970;    // mV
+int bms_cell_hi = 3700;  // mV (raw / 2)
+int bms_cell_lo = 3697;  // mV (raw / 2)
+int bms_tm = 24;
+int bms_ta = 22;
+int bms_tt = 24;
+int bms_soc = 52;        // %
+int bms_chg_polls = 0;   // counts charger polls for state progression
+int bms_force_act = 1;   // 1 = transition to Act on ready poll, 0 = stay in current state
+
+int sim_seq = 0;
+int sim_last_send = 0;
+int sim_active = 0;       // 1 = wake done, periodic polling running
+int auth_session = 0;     // alternates 0/1 per call → uses Session A or B from bike capture
+int wake_step = 0;        // 0 = idle, >0 = wake state machine running
+int wake_step_t = 0;
+int shut_step = 0;        // 1 = shutdown sent, waiting to drive line LOW
+int shut_step_t = 0;
+#define POLL_INTERVAL 1000
+int wake_got_c0 = 0;     // set by processCH1 when battery sends handshake Ping (0xC0..0xC3)
+int wake_got_auth = 0;   // set by processCH1 when battery sends Auth-Resp (cmd=0x30 from battery)
+int wake_mode = 0;       // 0 = motor, 1 = charger
+int sim_charger = 0;     // 0 = motor steady poll (03 05), 1 = charger steady poll (00 00)
+
+char hex_out[200];
+char dec_out[100];
+char stn[8];
+char raw_log[2000];
+char dec_log[1600];
+char tmp[2000];
+char ver[]="2026-05-09 17:30";
+
+int raw_lines = 0;
+int dec_lines = 0;
+#define RAW_MAX_LINES 24
+#define DEC_MAX_LINES 20
+
+// CRC-16/X-25: poly 0x8408 (reflected), init 0xFFFF, xorout 0xFFFF, refin/refout
+// CRC covers HEADER+LENGTH+PAYLOAD (excludes leading 0x00 prefix)
+int crc16(char data[], int start, int len) {
+    int crc = 0xFFFF;
+    int i = 0;
+    while (i < len) {
+        crc = crc ^ (data[start + i] & 0xFF);
+        int j = 0;
+        while (j < 8) {
+            if (crc & 0x0001) crc = ((crc >> 1) ^ 0x8408) & 0xFFFF;
+            else crc = (crc >> 1) & 0xFFFF;
+            j++;
+        }
+        i++;
+    }
+    return (crc ^ 0xFFFF) & 0xFFFF;
+}
+
+void trimFirst(char log[]) {
+    int p = 0;
+    while (log[p] && log[p] != 10) p++;
+    if (log[p] == 10) p++;
+    if (p > 0) {
+        strSub(tmp, log, p, strlen(log) - p);
+        strcpy(log, tmp);
+    }
+}
+
+// ---- Simulator: send frames as if we were the Motor/Display ----
+
+char sim_buf[64];
+
+// Send sim_buf byte-by-byte with ~2ms inter-byte gap.
+// CRITICAL: BMS validates inter-byte timing as part of "is this a real motor?" check.
+// Sending whole buffer via serialWriteBytes (back-to-back) gets rejected (silent
+// no-Auth-Resp, byte[4]=0x15 in subsequent Status). Verified empirically against
+// Pi's write.py (works) vs write_burst.py (fails) on the same battery.
+void simWriteTimed(int len) {
+    if (h1 < 0) return;
+    int i = 0;
+    while (i < len) {
+        serialWriteByte(h1, sim_buf[i] & 0xFF);
+        delayMicroseconds(2500);
+        i++;
+    }
+}
+
+void simLogTx(int len) {
+    seq++;
+    cnt2++;
+    sprintf(hex_out, "%d TX:", seq);
+    int i = 0;
+    while (i < len) {
+        sprintfAppend(hex_out, " %02X", sim_buf[i] & 0xFF);
+        i++;
+    }
+    addLog(hex_out);
+    if (raw_lines >= RAW_MAX_LINES) trimFirst(raw_log);
+    else raw_lines++;
+    raw_log += hex_out;
+    raw_log += "\n";
+    if (opt_flog) fileLog(LOG_FILE, hex_out, LOG_MAX_SIZE);
+}
+
+void simBuildAndSend(int header, int cmd_present, int cmd, char payload[], int payload_len) {
+    if (h1 < 0) return;
+    sim_buf[0] = 0x00;
+    sim_buf[1] = header & 0xFF;
+    int payload_offset;
+    int total_payload;
+    if (cmd_present) {
+        sim_buf[2] = (1 + payload_len) & 0xFF;
+        sim_buf[3] = cmd & 0xFF;
+        payload_offset = 4;
+        total_payload = 1 + payload_len;
+    } else {
+        sim_buf[2] = 0x00;
+        payload_offset = 3;
+        total_payload = 0;
+    }
+    int i = 0;
+    while (i < payload_len) {
+        sim_buf[payload_offset + i] = payload[i];
+        i++;
+    }
+    int crc_pos = 3 + total_payload;
+    int crc = crc16(sim_buf, 1, 2 + total_payload);
+    sim_buf[crc_pos] = crc & 0xFF;
+    sim_buf[crc_pos + 1] = (crc >> 8) & 0xFF;
+    int total = crc_pos + 2;
+    simWriteTimed(total);
+    simLogTx(total);
+}
+
+void simSendHandshake() {
+    char p[1];
+    simBuildAndSend(0x40 + (sim_seq & 0x03), 0, 0, p, 0);
+    sim_seq++;
+}
+
+// Fixed wake-up handshake bytes "00 40 00 21 49" — sent 3x to bootstrap battery MCU
+void simSendHandshakeRaw() {
+    if (h1 < 0) return;
+    sim_buf[0] = 0x00; sim_buf[1] = 0x40; sim_buf[2] = 0x00; sim_buf[3] = 0x21; sim_buf[4] = 0x49;
+    simWriteTimed(5);
+    simLogTx(5);
+}
+
+// Steady-state poll (called periodically once sim_active=1)
+//   Motor: 03 05 00 00 (matches bike capture's steady polling phase)
+//   Charger: 00 00 00 00
+void simSendPoll() {
+    char p[4];
+    if (sim_charger) { p[0] = 0x00; p[1] = 0x00; }
+    else             { p[0] = 0x03; p[1] = 0x05; }
+    p[2] = 0x00; p[3] = 0x00;
+    simBuildAndSend(0x00 + (sim_seq & 0x03), 1, 0x10, p, 4);
+    sim_seq++;
+}
+
+// Boot poll (02 02 00 00) — sent once during motor wake sequence between DevInfo and First Ready
+void simSendBootPoll() {
+    char p[4];
+    p[0] = 0x02; p[1] = 0x02; p[2] = 0x00; p[3] = 0x00;
+    simBuildAndSend(0x00 + (sim_seq & 0x03), 1, 0x10, p, 4);
+    sim_seq++;
+}
+
+// First ready-poll (03 31 00 00) — sent once during motor wake to trigger State→Active transition
+void simSendFirstReady() {
+    char p[4];
+    p[0] = 0x03; p[1] = 0x31; p[2] = 0x00; p[3] = 0x00;
+    simBuildAndSend(0x00 + (sim_seq & 0x03), 1, 0x10, p, 4);
+    sim_seq++;
+}
+
+// Charger Burst 1: HS-Pong (seq=1) + Auth-Req `02 01 ...` — sent as TWO separate
+// UART transmissions with ~80ms gap, mimicking the real charger's behavior.
+// Bytes captured from user's actual BT-E6000 + real Shimano charger session 2026-05-09.
+void simSendChgBurst1() {
+    if (h1 < 0) return;
+    // Frame 1: HS-Pong (5 bytes, seq=1)
+    sim_buf[0]=0x00; sim_buf[1]=0x41; sim_buf[2]=0x00; sim_buf[3]=0xF9; sim_buf[4]=0x50;
+    simWriteTimed(5);
+    simLogTx(5);
+
+    delay(80);  // inter-frame gap before Auth-Req (BMS rejects burst-glued HS+Auth)
+
+    // Frame 2: Auth-Req (22 bytes, sender 0x00 + seq 2, cmd 0x30, charger flavor 02 01)
+    int b[22];
+    b[0]=0x00;  b[1]=0x02;  b[2]=0x11;  b[3]=0x30;
+    b[4]=0x02;  b[5]=0x01;
+    b[6]=0x86;  b[7]=0xBB;  b[8]=0xD2;  b[9]=0x62;
+    b[10]=0xAF; b[11]=0x75; b[12]=0x42; b[13]=0x0E;
+    b[14]=0x82; b[15]=0x4B; b[16]=0x93; b[17]=0xF0;
+    b[18]=0x3C; b[19]=0x06;
+    b[20]=0xBF; b[21]=0x95;
+    int i = 0;
+    while (i < 22) { sim_buf[i] = b[i]; i++; }
+    simWriteTimed(22);
+    simLogTx(22);
+}
+
+// Charger Burst 2: Specs-Req (static, identical across sessions per md)
+void simSendChgBurst2() {
+    if (h1 < 0) return;
+    int b2[16];
+    b2[0]=0x00;  b2[1]=0x03;  b2[2]=0x0B;  b2[3]=0x31;
+    b2[4]=0x9E;  b2[5]=0x01;  b2[6]=0xA5;  b2[7]=0x01;
+    b2[8]=0x01;  b2[9]=0x00;  b2[10]=0x05; b2[11]=0x00;
+    b2[12]=0x10; b2[13]=0x00; b2[14]=0xA9; b2[15]=0xBC;
+    int i = 0;
+    while (i < 16) { sim_buf[i] = b2[i]; i++; }
+    simWriteTimed(16);
+    simLogTx(16);
+    sim_seq = 4;
+}
+
+// Auth-Req: replay one of two captured-from-bike Auth payloads, alternating per call.
+//   Random bytes with the same X/Y/X/Z structure are NOT accepted by the BMS
+//   (returns 2-byte degraded response, flips to byte[4]=0x15 after ~8s and
+//   never reaches Active state). Static replay of bytes the battery has seen
+//   from a real motor IS accepted — battery returns full 17-byte cryptographic
+//   Auth-Resp and proceeds to Active. Two sessions are alternated to mimic
+//   real motor's per-session variation.
+void simSendAuth() {
+    char p[16];
+    p[0]=0x03; p[1]=0x02; p[2]=0x00; p[3]=0x00;
+    if (auth_session == 0) {
+        // Session A — captured 2026-05-07 from user's bike (Frame 3, after first power-on)
+        p[4]=0xCB; p[5]=0x72; p[6]=0x1A; p[7]=0x01;   // X
+        p[8]=0x4B; p[9]=0x2E;                          // Y
+        p[10]=0xCB; p[11]=0x72; p[12]=0x1A; p[13]=0x01; // X repeat
+        p[14]=0x2E; p[15]=0x03;                        // Z
+    } else {
+        // Session B — captured 2026-05-07 from user's bike (Frame 89, after off/on cycle)
+        p[4]=0x73; p[5]=0x1B; p[6]=0x02; p[7]=0x4C;   // X
+        p[8]=0x2F; p[9]=0xCC;                          // Y
+        p[10]=0x73; p[11]=0x1B; p[12]=0x02; p[13]=0x4C; // X repeat
+        p[14]=0xB8; p[15]=0x02;                        // Z
+    }
+    auth_session = 1 - auth_session;
+    simBuildAndSend(0x00 + (sim_seq & 0x03), 1, 0x30, p, 16);
+    sim_seq++;
+}
+
+void simSendDevInfo() {
+    char p[1];
+    simBuildAndSend(0x00 + (sim_seq & 0x03), 1, 0x11, p, 0);
+    sim_seq++;
+}
+
+void simSendShutdown() {
+    char p[1];
+    simBuildAndSend(0x00 + (sim_seq & 0x03), 1, 0x21, p, 0);
+    sim_seq++;
+}
+
+// Trip-Req from user's bike capture (cmd=0x32, 6-byte payload "1A 05 06 11 3A 36")
+void simSendTrip() {
+    char p[6];
+    p[0]=0x1A; p[1]=0x05; p[2]=0x06; p[3]=0x11; p[4]=0x3A; p[5]=0x36;
+    simBuildAndSend(0x00 + (sim_seq & 0x03), 1, 0x32, p, 6);
+    sim_seq++;
+}
+
+// ---- BMS-Sim: respond to motor frames as if we were the battery ----
+
+void bmsSendHandshake(int seq) {
+    sim_buf[0] = 0x00;
+    sim_buf[1] = 0xC0 + (seq & 0x03);
+    sim_buf[2] = 0x00;
+    int crc = crc16(sim_buf, 1, 2);
+    sim_buf[3] = crc & 0xFF;
+    sim_buf[4] = (crc >> 8) & 0xFF;
+    simWriteTimed(5);
+    simLogTx(5);
+}
+
+void bmsSendStatus(int seq) {
+    char p[21];
+    int chi = bms_cell_hi * 2;
+    int clo = bms_cell_lo * 2;
+    p[0]=0x00;          // err byte = no error
+    p[1]=bms_state;
+    p[2]=0x00; p[3]=0x00; p[4]=0x00;
+    p[5]=bms_vbat & 0xFF;        p[6]=(bms_vbat >> 8) & 0xFF;
+    p[7]=chi & 0xFF;             p[8]=(chi >> 8) & 0xFF;
+    p[9]=clo & 0xFF;             p[10]=(clo >> 8) & 0xFF;
+    p[11]=bms_tm & 0xFF;
+    p[12]=bms_ta & 0xFF;
+    p[13]=bms_tt & 0xFF;
+    p[14]=bms_soc & 0xFF;
+    p[15]=0x90; p[16]=0x01;
+    p[17]=0x01;
+    p[18]=0x00; p[19]=0x00; p[20]=0x00;
+    simBuildAndSend(0x80 + (seq & 0x03), 1, 0x10, p, 21);
+}
+
+void bmsSendAuthResp(int seq) {
+    char p[17];
+    p[0]=0x00;
+    int t = millis();
+    int i = 1;
+    while (i < 17) {
+        p[i] = (t * (i + 7) + i * 113) & 0xFF;
+        i++;
+    }
+    simBuildAndSend(0x80 + (seq & 0x03), 1, 0x30, p, 17);
+}
+
+void bmsSendSpecsResp(int seq) {
+    char p[17];
+    p[0]=0x00; p[1]=0x9F; p[2]=0x01; p[3]=0xA9; p[4]=0x01;
+    p[5]=0x01; p[6]=0x00; p[7]=0x05; p[8]=0x00; p[9]=0x28;
+    p[10]=0x00; p[11]=0x6E; p[12]=0x00; p[13]=0xD8;
+    p[14]=0x01; p[15]=0x78; p[16]=0x00;
+    simBuildAndSend(0x80 + (seq & 0x03), 1, 0x31, p, 17);
+}
+
+void bmsSendDevInfoResp(int seq) {
+    char p[8];
+    p[0]=0x00; p[1]=0x29; p[2]=0x00; p[3]=0xC3;
+    p[4]=0x01; p[5]=0x00; p[6]=0x00; p[7]=0x5D;
+    simBuildAndSend(0x80 + (seq & 0x03), 1, 0x11, p, 8);
+}
+
+void bmsSendTripResp(int seq) {
+    char p[1];
+    p[0]=0x00;
+    simBuildAndSend(0x80 + (seq & 0x03), 1, 0x32, p, 1);
+}
+
+void bmsSendShutdownAck(int seq) {
+    char p[2];
+    p[0]=0x00; p[1]=0x00;
+    simBuildAndSend(0x80 + (seq & 0x03), 1, 0x21, p, 2);
+}
+
+void bmsHandle(int len) {
+    int sender = msg1[1] & 0xFF;
+    int seq = sender & 0x03;
+    int payload_len = msg1[2] & 0xFF;
+
+    // Handshake from motor/charger: sender 0x40..0x43, LEN=0
+    if ((sender & 0xFC) == 0x40 && payload_len == 0) {
+        bmsSendHandshake(seq);
+        return;
+    }
+    if (len < 4) return;
+    int cmd = msg1[3] & 0xFF;
+
+    if (cmd == 0x30) { bmsSendAuthResp(seq); return; }
+    if (cmd == 0x31) { bmsSendSpecsResp(seq); return; }
+    if (cmd == 0x11) { bmsSendDevInfoResp(seq); return; }
+    if (cmd == 0x32) { bmsSendTripResp(seq); return; }
+    if (cmd == 0x21) { bmsSendShutdownAck(seq); return; }
+
+    if (cmd == 0x10 && payload_len == 5) {
+        int p0 = msg1[4] & 0xFF;
+        if (p0 == 0x03) {
+            // Ready poll (motor) → transition to Active
+            if (bms_force_act) bms_state = 0x01;
+        } else if (p0 == 0x02) {
+            bms_state = 0x00;
+        } else if (p0 == 0x00) {
+            // Charger poll → progress Init → Pre → Chg
+            bms_chg_polls++;
+            if (bms_chg_polls < 2) bms_state = 0x00;
+            else if (bms_chg_polls < 4) bms_state = 0x02;
+            else bms_state = 0x03;
+        }
+        bmsSendStatus(seq);
+        return;
+    }
+}
+
+void applyMode(int new_mode) {
+    if (h1 >= 0) { serialClose(h1); h1 = -1; }
+    if (h2 >= 0) { serialClose(h2); h2 = -1; }
+    msg1_len = 0;
+    msg2_len = 0;
+    if (new_mode == 1) {
+        // Simulator (Motor or Charger): TX=GPIO18, RX=GPIO19
+        h1 = serialBegin(CH1_RX_PIN, CH2_RX_PIN, BAUD, SERIAL_CFG, BUF_SIZE);
+        sim_active = 0;
+        addLog("Mode: SIMULATOR (TX=GPIO18 RX=GPIO19)");
+    } else if (new_mode == 2) {
+        // Sim-BMS: TX=GPIO19 (battery TX line), RX=GPIO18 (motor TX line)
+        h1 = serialBegin(CH2_RX_PIN, CH1_RX_PIN, BAUD, SERIAL_CFG, BUF_SIZE);
+        bms_state = 0;
+        bms_chg_polls = 0;
+        addLog("Mode: SIM-BMS (TX=GPIO19 RX=GPIO18)");
+    } else {
+        // Sniffer: two RX-only ports
+        h1 = serialBegin(CH1_RX_PIN, -1, BAUD, SERIAL_CFG, BUF_SIZE);
+        h2 = serialBegin(CH2_RX_PIN, -1, BAUD, SERIAL_CFG, BUF_SIZE);
+        addLog("Mode: SNIFFER");
+    }
+    last_mode = new_mode;
+    sim_seq = 0;
+    sim_last_send = 0;
+}
+
+void processCH1(int len) {
+    int payload_len = msg1[2] & 0xFF;
+
+    // Detect battery handshake Ping (sender 0xC0..0xC3, LEN=0)
+    if ((msg1[1] & 0xFC) == 0xC0 && payload_len == 0) {
+        wake_got_c0 = 1;
+    }
+    // Detect battery Auth-Resp (sender 0x80..0x83, cmd=0x30)
+    if ((msg1[1] & 0xFC) == 0x80 && payload_len > 0 && (msg1[3] & 0xFF) == 0x30) {
+        wake_got_auth = 1;
+    }
+
+    cnt1++;
+    seq++;
+
+    sprintf(hex_out, "%d B-TX:", seq);
+    int i = 0;
+    while (i < len) {
+        sprintfAppend(hex_out, " %02X", msg1[i] & 0xFF);
+        i++;
+    }
+    int rx_crc = (msg1[len - 2] & 0xFF) | ((msg1[len - 1] & 0xFF) << 8);
+    int calc_crc = crc16(msg1, 1, len - 3);
+    if (rx_crc != 0x0000 && rx_crc != calc_crc) {
+        sprintfAppend(hex_out, " [CRC!%04X]", calc_crc);
+        err1++;
+    }
+
+    addLog(hex_out);
+
+    if (raw_lines >= RAW_MAX_LINES) trimFirst(raw_log);
+    else raw_lines++;
+    raw_log += hex_out;
+    raw_log += "\n";
+
+    if (opt_flog) {
+        fileLog(LOG_FILE, hex_out, LOG_MAX_SIZE);
+    }
+
+    // BMS-Sim mode: respond to motor frame instead of decoding battery side
+    if (opt_mode == 2) {
+        bmsHandle(len);
+        return;
+    }
+
+    if (payload_len > 0) {
+        int cmd = msg1[3] & 0xFF;
+        dec_out = "";
+        if (cmd == 0x10 && payload_len == 22) {
+            int er = msg1[4] & 0xFF;
+            int st = msg1[5] & 0xFF;
+            int cc = msg1[7] & 0xFF;       // cell connection flag (0x02 = no cells)
+            int pv = (msg1[9] & 0xFF) | ((msg1[10] & 0xFF) << 8);
+            int cx = ((msg1[11] & 0xFF) | ((msg1[12] & 0xFF) << 8)) / 2;
+            int cn = ((msg1[13] & 0xFF) | ((msg1[14] & 0xFF) << 8)) / 2;
+            int tm = msg1[15] & 0xFF;
+            int ta = msg1[16] & 0xFF;
+            int tt = msg1[17] & 0xFF;
+            int sc = msg1[18] & 0xFF;
+            int b19 = msg1[19] & 0xFF;     // motor: 0x90 const  | charger: ChgCtr
+            int b20 = msg1[20] & 0xFF;     // motor: 0x01 const  | charger: 0x00
+            int b21 = msg1[21] & 0xFF;     // motor: load/current | charger: 0x00
+            if (st == 0) strcpy(stn, "Init");
+            else if (st == 1) strcpy(stn, "Act");
+            else if (st == 2) strcpy(stn, "Pre");
+            else if (st == 3) strcpy(stn, "Chg");
+            else sprintf(stn, "x%02X", st);
+            sprintf(dec_out, "%d %s[%d] E=%02X", seq, stn, st, er);
+            if (cc != 0x00) sprintfAppend(dec_out, " CC=%02X", cc);
+            sprintfAppend(dec_out, " Vbat=%d.%03dV", pv/1000, pv%1000);
+            sprintfAppend(dec_out, " Vmax=%d.%03dV", cx/1000, cx%1000);
+            sprintfAppend(dec_out, " Vmin=%d.%03dV", cn/1000, cn%1000);
+            sprintfAppend(dec_out, " T=%d/%d/%d", tm, ta, tt);
+            sprintfAppend(dec_out, " SOC=%d%%", sc);
+            // Distinguish motor (90 01 + load) vs charger (ChgCtr) context.
+            // Calibration 2026-05-09 (two-point linear fit):
+            //   byte[21]=11 → 531 mA, byte[21]=6 → 316 mA  →  I_mA = 43*byte + 58
+            //   Offset of 58 mA likely represents BMS/electronics quiescent draw.
+            if (b19 == 0x90 && b20 == 0x01) {
+                sprintfAppend(dec_out, " I=%dmA", b21 * 43 + 58);
+            } else if (b19 != 0) {
+                sprintfAppend(dec_out, " ChgCtr=%d", b19);
+            }
+        }
+        if (cmd == 0x30) { sprintf(dec_out, "%d Auth", seq); }
+        if (cmd == 0x31) { sprintf(dec_out, "%d Specs", seq); }
+        if (cmd == 0x11) { sprintf(dec_out, "%d DevInfo", seq); }
+        if (cmd == 0x21) { sprintf(dec_out, "%d Shutdown", seq); }
+        if (cmd == 0x32) { sprintf(dec_out, "%d Trip", seq); }
+
+        if (strlen(dec_out) > 0) {
+            if (dec_lines >= DEC_MAX_LINES) trimFirst(dec_log);
+            else dec_lines++;
+            dec_log += dec_out;
+            dec_log += "\n";
+        }
+    }
+}
+
+void processCH2(int len) {
+    int payload_len = msg2[2] & 0xFF;
+
+    cnt2++;
+    seq++;
+
+    sprintf(hex_out, "%d B-RX:", seq);
+    int i = 0;
+    while (i < len) {
+        sprintfAppend(hex_out, " %02X", msg2[i] & 0xFF);
+        i++;
+    }
+    int rx_crc = (msg2[len - 2] & 0xFF) | ((msg2[len - 1] & 0xFF) << 8);
+    int calc_crc = crc16(msg2, 1, len - 3);
+    if (rx_crc != 0x0000 && rx_crc != calc_crc) {
+        sprintfAppend(hex_out, " [CRC!%04X]", calc_crc);
+        err2++;
+    }
+
+    addLog(hex_out);
+
+    if (raw_lines >= RAW_MAX_LINES) trimFirst(raw_log);
+    else raw_lines++;
+    raw_log += hex_out;
+    raw_log += "\n";
+
+    if (opt_flog) {
+        fileLog(LOG_FILE, hex_out, LOG_MAX_SIZE);
+    }
+
+    if (payload_len > 0) {
+        int cmd = msg2[3] & 0xFF;
+        dec_out = "";
+        if (cmd == 0x10 && payload_len == 5) { sprintf(dec_out, "%d Poll", seq); }
+        if (cmd == 0x30) { sprintf(dec_out, "%d Auth-Req", seq); }
+        if (cmd == 0x31) { sprintf(dec_out, "%d Specs-Req", seq); }
+        if (cmd == 0x11) { sprintf(dec_out, "%d DevInfo-Req", seq); }
+        if (cmd == 0x21) { sprintf(dec_out, "%d Shutdown-Req", seq); }
+        if (cmd == 0x32) { sprintf(dec_out, "%d Trip-Req", seq); }
+
+        if (strlen(dec_out) > 0) {
+            if (dec_lines >= DEC_MAX_LINES) trimFirst(dec_log);
+            else dec_lines++;
+            dec_log += dec_out;
+            dec_log += "\n";
+        }
+    }
+}
+
+void extractCH1() {
+    while (msg1_len >= 3) {
+        if ((msg1[0] & 0xFF) != 0x00) {
+            int i = 0;
+            while (i < msg1_len - 1) { msg1[i] = msg1[i+1]; i++; }
+            msg1_len--;
+            err1++;
+            continue;
+        }
+        int payload_len = msg1[2] & 0xFF;
+        if (payload_len > MAX_PAYLOAD) {
+            int i = 0;
+            while (i < msg1_len - 1) { msg1[i] = msg1[i+1]; i++; }
+            msg1_len--;
+            err1++;
+            continue;
+        }
+        int expected = 3 + payload_len + 2;
+        if (msg1_len < expected) break;
+        processCH1(expected);
+        int i = 0;
+        while (i + expected < msg1_len) { msg1[i] = msg1[i + expected]; i++; }
+        msg1_len = msg1_len - expected;
+    }
+}
+
+void extractCH2() {
+    while (msg2_len >= 3) {
+        if ((msg2[0] & 0xFF) != 0x00) {
+            int i = 0;
+            while (i < msg2_len - 1) { msg2[i] = msg2[i+1]; i++; }
+            msg2_len--;
+            err2++;
+            continue;
+        }
+        int payload_len = msg2[2] & 0xFF;
+        if (payload_len > MAX_PAYLOAD) {
+            int i = 0;
+            while (i < msg2_len - 1) { msg2[i] = msg2[i+1]; i++; }
+            msg2_len--;
+            err2++;
+            continue;
+        }
+        int expected = 3 + payload_len + 2;
+        if (msg2_len < expected) break;
+        processCH2(expected);
+        int i = 0;
+        while (i + expected < msg2_len) { msg2[i] = msg2[i + expected]; i++; }
+        msg2_len = msg2_len - expected;
+    }
+}
+
+void EveryLoop() {
+    if (opt_mode != last_mode) applyMode(opt_mode);
+    if (opt_mode == 0 && !opt_running) return;
+    // BMS-Sim runs always (it's reactive — only sends on incoming motor frames)
+    int now = millis();
+
+    if (h2 >= 0) {
+        while (serialAvailable(h2) > 0) {
+            int b = serialRead(h2);
+            if (b >= 0) {
+                last2 = millis();
+                if (msg2_len < MAX_MSG) { msg2[msg2_len] = b; msg2_len++; }
+                else { msg2_len = 0; err2++; }
+            }
+        }
+    }
+    if (h1 >= 0) {
+        while (serialAvailable(h1) > 0) {
+            int b = serialRead(h1);
+            if (b >= 0) {
+                last1 = millis();
+                if (msg1_len < MAX_MSG) { msg1[msg1_len] = b; msg1_len++; }
+                else { msg1_len = 0; err1++; }
+            }
+        }
+    }
+
+    extractCH1();
+    if (h2 >= 0) extractCH2();
+
+    if (msg1_len > 0 && (now - last1) > GAP_MS && (h1 < 0 || serialAvailable(h1) == 0)) {
+        err1++;
+        msg1_len = 0;
+    }
+    if (h2 >= 0 && msg2_len > 0 && (now - last2) > GAP_MS && serialAvailable(h2) == 0) {
+        err2++;
+        msg2_len = 0;
+    }
+
+    if (wake_step > 0 && opt_mode == 1) {
+        int dt = now - wake_step_t;
+        if (wake_step == 1 && (wake_got_c0 || dt >= 3000)) {
+            if (!wake_got_c0) {
+                simSendHandshakeRaw();
+                wake_step = 2;
+                wake_step_t = now;
+            } else {
+                // Battery initiated handshake; for motor, send Pong first separately
+                if (wake_mode == 0) simSendHandshakeRaw();
+                wake_step = 4;
+                wake_step_t = now;
+                wake_got_auth = 0;
+            }
+        } else if (wake_step == 2 && (wake_got_c0 || dt >= 1500)) {
+            wake_step = 4;
+            wake_step_t = now;
+            wake_got_auth = 0;
+        } else if (wake_step == 4 && dt >= 50) {
+            // Send Auth-Req (fresh) for motor; combined burst for charger
+            if (wake_mode == 1) simSendChgBurst1();
+            else simSendAuth();
+            wake_step = 5;
+            wake_step_t = now;
+        } else if (wake_step == 5 && (wake_got_auth || dt >= 1000)) {
+            if (wake_mode == 1) {
+                simSendChgBurst2();
+                wake_step = 0;
+                sim_active = 1;     // charger steady polling auto-starts
+            } else {
+                simSendBootPoll();   // Motor Boot Poll (02 02)
+                wake_step = 6;
+                wake_step_t = now;
+            }
+            sim_last_send = now;
+        } else if (wake_step == 6 && dt >= 100) {
+            simSendDevInfo();
+            wake_step = 7;
+            wake_step_t = now;
+        } else if (wake_step == 7 && dt >= 200) {
+            simSendFirstReady();    // Motor First Ready Poll (03 31) — triggers State→Active
+            wake_step = 8;
+            wake_step_t = now;
+        } else if (wake_step == 8 && dt >= 200) {
+            simSendTrip();          // Trip-Req (required by BMS to leave Init transient)
+            wake_step = 9;
+            wake_step_t = now;
+        } else if (wake_step == 9 && dt >= 200) {
+            // Wake done — auto-start steady polling (03 05 for motor)
+            sim_active = 1;
+            wake_step = 0;
+            sim_last_send = now;
+        }
+    }
+
+    if (sim_active && opt_mode == 1 && (now - sim_last_send) >= POLL_INTERVAL) {
+        simSendPoll();
+        sim_last_send = now;
+    }
+
+    // Post-shutdown: drive GPIO18 to GND so BMS wake-latch releases
+    if (shut_step == 1 && (now - shut_step_t) >= 200) {
+        if (h1 >= 0) { serialClose(h1); h1 = -1; }
+        gpioInit(CH2_RX_PIN, 3);       // OUTPUT
+        digitalWrite(CH2_RX_PIN, 0);   // LOW
+        addLog("Shutdown: GPIO18 driven LOW (BMS sleep)");
+        shut_step = 0;
+    }
+}
+
+void WebUI() {
+    webRadio(opt_mode, "Sniffer|Simulator|Sim-BMS");
+    webCheckbox(opt_decode, "Decode");
+    webCheckbox(opt_flog, "File Log");
+    if (opt_mode == 0) {
+        webCheckbox(opt_running, "Sniff");
+    } else if (opt_mode == 2) {
+        webCheckbox(bms_force_act, "Force Active on ready-poll");
+        webNumber(bms_soc, 0, 100, "Fake SOC %");
+        webNumber(bms_vbat, 30000, 42000, "Fake Vbat (mV)");
+    }
+
+    char buf[160];
+    sprintf(buf, "<hr><small>TX:%d RX:%d Err:%d/%d #%d</small>", cnt1, cnt2, err1, err2, seq);
+    webSend(buf);
+    webSend(" <a href='/ufsd' target='_blank' style='font-size:11px'>[File Manager]</a>");
+    webSend(" <a href='javascript:void(0)' onclick=\"document.getElementById('rl').textContent='';document.getElementById('dl').textContent='';fetch('/cm?cmnd=SHClr')\" style='font-size:11px'>[Clear Log]</a>");
+    webSend(" <a href='javascript:void(0)' onclick=\"if(confirm('Delete shimano.log?')){fetch('/ufsd?delete=/shimano.log&download=/')}\" style='font-size:11px'>[Delete shimano.log]</a>");
+    if (opt_mode == 1) {
+        webSend("<div style='margin-top:6px;font-size:12px;line-height:1.6'>");
+        webSend("<a href='javascript:void(0)' onclick=\"fetch('/cm?cmnd=SHSimm')\" style='font-weight:bold'>[Sim-Motor]</a>");
+        webSend(" <span style='color:#888'>— Simulate a Shimano Motor (activate the battery → release voltage)</span><br>");
+        webSend("<a href='javascript:void(0)' onclick=\"fetch('/cm?cmnd=SHSimc')\" style='font-weight:bold'>[Sim-Charger]</a>");
+        webSend(" <span style='color:#888'>— Simulate a Shimano Charger (charge the battery with any 42V power supply)</span><br>");
+        webSend("<a href='javascript:void(0)' onclick=\"fetch('/cm?cmnd=SHShut')\">[Shutdown]</a>");
+        webSend("</div>");
+    }
+
+    webSend("<div style='width:100%;height:350px;overflow-y:auto;display:flex;flex-direction:column-reverse;border:1px solid #555'>");
+    webSend("<pre id='rl' style='margin:0;background:#252525;color:#0f0;padding:4px;font-size:11px;width:100%;box-sizing:border-box'>");
+    webSend(raw_log);
+    webSend("</pre></div>");
+
+    webSend("<div style='width:100%;height:350px;overflow-y:auto;display:flex;flex-direction:column-reverse;border:1px solid #555'>");
+    webSend("<pre id='dl' style='margin:0;background:#252525;color:#ff0;padding:4px;font-size:11px;width:100%;box-sizing:border-box'>");
+    if (opt_decode) {
+        webSend(dec_log);
+    }
+    webSend("</pre></div>");
+    webSend("<script>rfsh=1;if(!window._selHook){window._selHook=1;document.addEventListener('selectionchange',function(){rfsh=window.getSelection().toString().length?0:1;});}</script>");
+}
+
+void WebCall() {
+    char buf[64];
+    sprintf(buf, "{s}Shimano Logger %s{m}TX:%d RX:%d E:%d/%d{e}", ver, cnt1, cnt2, err1, err2);
+    webSend(buf);
+}
+
+void Command(char cmd[]) {
+    if (strFind(cmd, "CLR") >= 0) {
+        raw_log = "";
+        dec_log = "";
+        raw_lines = 0;
+        dec_lines = 0;
+        responseCmnd("{\"SH\":\"cleared\"}");
+    } else if (strFind(cmd, "SIMM") >= 0) {
+        // Start motor simulation: full wake sequence + auto-steady polling
+        if (opt_mode == 1) {
+            if (h1 < 0) applyMode(opt_mode);
+            sim_active = 0;
+            sim_charger = 0;
+            sim_seq = 0;
+            wake_got_c0 = 0;
+            wake_mode = 0;
+            wake_step = 1;
+            wake_step_t = millis();
+            responseCmnd("{\"SH\":\"sim-motor started\"}");
+        } else {
+            responseCmnd("{\"SH\":\"not in sim mode\"}");
+        }
+    } else if (strFind(cmd, "SIMC") >= 0) {
+        // Start charger simulation: full wake sequence + auto-steady polling
+        if (opt_mode == 1) {
+            if (h1 < 0) applyMode(opt_mode);
+            sim_active = 0;
+            sim_charger = 1;
+            sim_seq = 0;
+            wake_got_c0 = 0;
+            wake_mode = 1;
+            wake_step = 1;
+            wake_step_t = millis();
+            responseCmnd("{\"SH\":\"sim-charger started\"}");
+        } else {
+            responseCmnd("{\"SH\":\"not in sim mode\"}");
+        }
+    } else if (strFind(cmd, "SHUT") >= 0) {
+        if (opt_mode == 1) {
+            sim_active = 0;
+            simSendShutdown();
+            shut_step = 1;
+            shut_step_t = millis();
+            responseCmnd("{\"SH\":\"shutdown — line goes LOW in 200ms\"}");
+        } else {
+            responseCmnd("{\"SH\":\"not in sim mode\"}");
+        }
+    } else {
+        char rsp[80];
+        sprintf(rsp, "{\"SH\":\"unknown:[%s]\"}", cmd);
+        responseCmnd(rsp);
+    }
+}
+
+void OnExit() {
+    if (h1 >= 0) { serialClose(h1); }
+    if (h2 >= 0) { serialClose(h2); }
+    addLog("Shimano Sniffer stopped.");
+}
+
+int main() {
+    msg1_len = 0; cnt1 = 0; err1 = 0; last1 = millis();
+    msg2_len = 0; cnt2 = 0; err2 = 0; last2 = millis();
+    seq = 0;
+    raw_log = "";
+    dec_log = "";
+    raw_lines = 0;
+    dec_lines = 0;
+
+    applyMode(opt_mode);
+    if (h1 < 0) {
+        addLog("ERROR: serialBegin failed!");
+        return -1;
+    }
+
+    webPageLabel(0, "Shimano");
+    addCommand("SH");
+
+    char info[80];
+    sprintf(info, "Shimano Logger %s: B-TX=GPIO%d B-RX=GPIO%d", ver, CH1_RX_PIN, CH2_RX_PIN);
+    addLog(info);
+    return 0;
+}
